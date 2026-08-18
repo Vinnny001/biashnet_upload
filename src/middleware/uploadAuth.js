@@ -3,8 +3,16 @@
 import axios from "axios";
 import { AppError } from "../utils/errors.js";
 
-const MAIN_API_URL =
+
+if (process.env.MODE === "production") {
+  const MAIN_API_URL =
   process.env.MAIN_API_URL || "http://localhost:5000/api";
+} else {
+  const MAIN_API_URL =
+  process.env.LOCAL_API_URL || "http://localhost:5000/api";
+  
+}
+
 
 const UPLOAD_API_KEY =
   process.env.UPLOAD_API_KEY;

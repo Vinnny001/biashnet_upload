@@ -156,10 +156,20 @@ console.log(
 );
 
 
-console.log(
+if (process.env.MODE === "production") {
+  console.log(
   "MAIN_API_URL:",
   process.env.MAIN_API_URL
 );
+}
+
+else {
+  console.log(
+  "MAIN_API_URL:",
+  process.env.LOCAL_API_URL
+);
+}
+
 
 
 app.listen(
