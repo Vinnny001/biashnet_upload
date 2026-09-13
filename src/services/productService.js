@@ -7,9 +7,13 @@ const productsRef = db.collection("products");
 |--------------------------------------------------------------------------
 | Re-review on edit
 |--------------------------------------------------------------------------
-| Changing any of these on a listing that has already been reviewed sends it
-| back to "pending". They're what a moderator judges: what the item is, how
-| it's described, and what it looks like.
+| Every uploaded photo and every piece of text a buyer reads must meet the
+| seller listing policy (public/seller-listing-policy.html in the frontend),
+| so changing any of these on a listing that has already been reviewed sends
+| it back to "pending".
+|
+| Price and stock are numbers set by the seller's own trading, not content,
+| so changing them keeps the listing live. Deleting a listing needs no review.
 */
 
 const REVIEW_FIELDS = [
@@ -19,6 +23,7 @@ const REVIEW_FIELDS = [
   "category",
   "subCategory",
   "condition",
+  "location",
   "images",
 ];
 
