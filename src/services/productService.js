@@ -1,6 +1,57 @@
 import { db, FieldValue } from "../config/firebase.js";
+import { notifyAdminsOfPendingProduct } from "./adminNotificationService.js";
 
 const productsRef = db.collection("products");
+
+/*
+|--------------------------------------------------------------------------
+| Re-review on edit
+|--------------------------------------------------------------------------
+| Changing any of these on a listing that has already been reviewed sends it
+| back to "pending". They're what a moderator judges: what the item is, how
+| it's described, and what it looks like.
+*/
+
+const REVIEW_FIELDS = [
+  "name",
+  "title",
+  "description",
+  "category",
+  "subCategory",
+  "condition",
+  "images",
+];
+
+const RE_REVIEW_STATUSES = ["approved", "active", "rejected"];
+
+/*
+ * Images are compared by their Cloudinary public_id, so the same photos sent
+ * back in a different JSON shape don't count as a change. Order is kept:
+ * swapping which photo comes first changes the listing's cover image.
+ */
+function imageSignature(images) {
+  return JSON.stringify(
+    (Array.isArray(images) ? images : []).map((image) =>
+      typeof image === "string"
+        ? image
+        : image?.public_id || image?.original || image?.full || JSON.stringify(image)
+    )
+  );
+}
+
+function sameFieldValue(field, next, current) {
+  if (field === "images") {
+    return imageSignature(next) === imageSignature(current);
+  }
+
+  return String(next ?? "").trim() === String(current ?? "").trim();
+}
+
+function changedReviewFields(updates, existing) {
+  return REVIEW_FIELDS.filter(
+    (field) => field in updates && !sameFieldValue(field, updates[field], existing[field])
+  );
+}
 
 /*
 |--------------------------------------------------------------------------
@@ -164,6 +215,26 @@ export const productService = {
 
     const snapshot = await docRef.get();
 
+    /*
+    |--------------------------------------------------------------------------
+    | Tell admins there's something to review
+    |--------------------------------------------------------------------------
+    | Not awaited: fanning out to every admin's devices shouldn't slow the
+    | seller's upload response, and a notification failure must never make a
+    | saved listing look like it failed.
+    */
+
+    if (productData.status === "pending") {
+      notifyAdminsOfPendingProduct({
+        productId: snapshot.id,
+        title,
+        price,
+        sellerName: productData.sellerName,
+      }).catch((error) =>
+        console.error("Could not notify admins of pending product:", error.message)
+      );
+    }
+
     return {
       id: snapshot.id,
       ...snapshot.data(),
@@ -248,13 +319,49 @@ export const productService = {
         : 0;
   }
 
+  /*
+  |--------------------------------------------------------------------------
+  | Edits that change what buyers see go back for review
+  |--------------------------------------------------------------------------
+  | Approval is of the listing's content. Without this a seller could get a
+  | listing approved and then swap its photos or title for something that
+  | would never have passed. Price and stock changes don't need a
+  | moderator, so they don't trigger it — the listing stays live.
+  |
+  | A rejected listing that the seller fixes also goes back to "pending", so
+  | it can be reconsidered instead of staying rejected.
+  */
+
+  const sendBackForReview =
+    RE_REVIEW_STATUSES.includes(String(existing.status || "").toLowerCase()) &&
+    changedReviewFields(updates, existing).length > 0;
+
+  if (sendBackForReview) {
+    updates.status = "pending";
+    updates.previousStatus = existing.status;
+    updates.resubmittedAt = FieldValue.serverTimestamp();
+  }
+
   await docRef.set(updates, { merge: true });
 
   const updatedSnapshot = await docRef.get();
 
+  if (sendBackForReview) {
+    notifyAdminsOfPendingProduct({
+      productId: id,
+      title: updates.title ?? existing.title ?? updates.name ?? existing.name,
+      price: updates.price ?? existing.price,
+      sellerName: existing.sellerName,
+      edited: true,
+    }).catch((error) =>
+      console.error("Could not notify admins of edited product:", error.message)
+    );
+  }
+
   return {
     id: updatedSnapshot.id,
     ...updatedSnapshot.data(),
+    sentForReview: sendBackForReview,
   };
 },
 
