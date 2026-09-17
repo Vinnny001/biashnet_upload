@@ -13,6 +13,13 @@ import { errorHandler } from "./src/utils/errors.js";
 
 const app = express();
 
+/*
+ * Behind Render's proxy the socket address is the proxy's, so without
+ * this the rate limiter below counts every seller into one allowance and
+ * starts refusing uploads that were never anyone's fault.
+ */
+app.set("trust proxy", 1);
+
 
 /* ==========================================================================
    CORS
