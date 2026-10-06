@@ -104,7 +104,27 @@ async function pushToUser(userId, { title, message, data }) {
  * `recipients` defaults to every active admin. It can be given explicitly
  * so the notification can be exercised without messaging real admins.
  */
-export async function notifyAdminsOfPendingProduct({ productId, title, price, sellerName, edited = false, recipients }) {
+/*
+ * `reasons` are why the automatic check would not approve the listing, as
+ * [{ rule, detail }]. Given them, the notification says what to look at
+ * rather than just that something arrived — an admin opening a flagged
+ * listing already knows what the problem is said to be.
+ */
+function describeReasons(reasons) {
+  const details = (Array.isArray(reasons) ? reasons : [])
+    .map((reason) => String(reason?.rule || "").trim())
+    .filter(Boolean);
+
+  if (details.length === 0) return "";
+
+  const [first, ...rest] = details;
+
+  return rest.length === 0
+    ? ` Flagged for: ${first}.`
+    : ` Flagged for: ${first} (and ${rest.length} more).`;
+}
+
+export async function notifyAdminsOfPendingProduct({ productId, title, price, sellerName, edited = false, reasons, recipients }) {
   const admins = Array.isArray(recipients) ? recipients : await activeAdminUids();
 
   if (admins.length === 0) return { notified: 0 };
@@ -113,12 +133,13 @@ export async function notifyAdminsOfPendingProduct({ productId, title, price, se
   const amount = Number(price) || 0;
   const seller = String(sellerName || "").trim() || "A seller";
   const priced = `(KES ${amount.toLocaleString("en-KE")})`;
+  const flagged = describeReasons(reasons);
 
   // An edit to a reviewed listing takes it off the storefront until approved.
   const notificationTitle = edited ? "Edited listing to review" : "New listing to review";
   const message = edited
-    ? `${seller} changed "${listing}" ${priced}. It's hidden from buyers until you review the changes.`
-    : `${seller} uploaded "${listing}" ${priced}. Review it before it appears on Biashnet.`;
+    ? `${seller} changed "${listing}" ${priced}. It's hidden from buyers until you review the changes.${flagged}`
+    : `${seller} uploaded "${listing}" ${priced}. Review it before it appears on Biashnet.${flagged}`;
 
   const type = "PRODUCT_PENDING_REVIEW";
 

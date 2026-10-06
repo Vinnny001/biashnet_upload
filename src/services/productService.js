@@ -1,7 +1,126 @@
+import { randomUUID } from "node:crypto";
+
 import { db, FieldValue } from "../config/firebase.js";
 import { notifyAdminsOfPendingProduct } from "./adminNotificationService.js";
+import { isPolicyReviewEnabled, reviewListing } from "./policyReviewService.js";
 
 const productsRef = db.collection("products");
+
+/*
+|--------------------------------------------------------------------------
+| Automatic first-pass review
+|--------------------------------------------------------------------------
+| A new or edited listing is saved as "pending" and then read against the
+| seller listing policy (services/policyReviewService.js). A listing that
+| meets it goes live on its own; anything else waits for an admin, who gets
+| the reasons with the notification.
+|
+| Saved first, checked after. The seller's upload must not wait on a model,
+| and an outage must never fail an upload — so if the check never finishes,
+| the listing simply stays pending, which is exactly where it used to sit.
+|
+| Nothing here can reject a listing. Only an admin can.
+*/
+
+/*
+ * Stamped on the listing when a check starts, and checked again before the
+ * verdict is written. Without it a slow verdict could land after an admin
+ * had already decided, or after the seller's next edit, and quietly undo it.
+ */
+function reviewTicket() {
+  return randomUUID();
+}
+
+async function applyVerdict(productId, ticket, verdict) {
+  const docRef = productsRef.doc(productId);
+
+  return db.runTransaction(async (transaction) => {
+    const snapshot = await transaction.get(docRef);
+
+    if (!snapshot.exists) return { applied: false, reason: "deleted" };
+
+    const current = snapshot.data() || {};
+
+    /*
+     * A newer check has started — the seller edited again while this one was
+     * running — so this verdict is about text and photos that are gone.
+     */
+    if (current.policyReview?.ticket !== ticket) {
+      return { applied: false, reason: "superseded" };
+    }
+
+    /*
+     * An admin got there first. Their decision stands.
+     */
+    if (String(current.status || "").toLowerCase() !== "pending") {
+      return { applied: false, reason: "already decided" };
+    }
+
+    const policyReview = {
+      ticket,
+      decision: verdict.decision,
+      reasons: verdict.reasons,
+      summary: verdict.summary || "",
+      model: verdict.model || null,
+      interactionId: verdict.interactionId || null,
+      failed: Boolean(verdict.failed),
+      checkedAt: FieldValue.serverTimestamp(),
+    };
+
+    const updates = { policyReview, updatedAt: FieldValue.serverTimestamp() };
+
+    if (verdict.decision === "approve") {
+      updates.status = "approved";
+      updates.reviewedBy = "ai";
+      updates.reviewedAt = FieldValue.serverTimestamp();
+
+      /*
+       * Clears the note from an earlier rejection: the seller fixed it.
+       */
+      updates.reviewNote = null;
+    }
+
+    transaction.set(docRef, updates, { merge: true });
+
+    return { applied: true, decision: verdict.decision };
+  });
+}
+
+/*
+ * Runs after the upload has already been answered. Never awaited, never
+ * throws — a failure here leaves the listing pending for an admin, which is
+ * the safe outcome.
+ */
+async function startPolicyReview(productId, ticket, listing, { edited = false } = {}) {
+  const verdict = await reviewListing(listing);
+
+  const outcome = await applyVerdict(productId, ticket, verdict);
+
+  if (!outcome.applied) {
+    console.log(`Policy review for ${productId} discarded (${outcome.reason}).`);
+    return;
+  }
+
+  if (verdict.decision === "approve") {
+    console.log(`Policy review approved ${productId}; it is live.`);
+    return;
+  }
+
+  await notifyAdminsOfPendingProduct({
+    productId,
+    title: listing.title || listing.name,
+    price: listing.price,
+    sellerName: listing.sellerName,
+    edited,
+    reasons: verdict.reasons,
+  });
+}
+
+function queuePolicyReview(productId, ticket, listing, options) {
+  startPolicyReview(productId, ticket, listing, options).catch((error) =>
+    console.error(`Policy review for ${productId} failed outright:`, error.message)
+  );
+}
 
 /*
 |--------------------------------------------------------------------------
@@ -148,6 +267,13 @@ export const productService = {
     });
 
     /*
+     * Without an API key there is no automatic check, and the flow is
+     * exactly what it was before this existed: pending, and an admin is
+     * told. Local development and a lapsed key both land here.
+     */
+    const reviewEnabled = isPolicyReviewEnabled();
+
+    /*
     |--------------------------------------------------------------------------
     | Build Firestore product
     |--------------------------------------------------------------------------
@@ -190,11 +316,18 @@ export const productService = {
       sellerWhatsapp: seller.whatsapp || seller.phone || "",
       sellerPhoto: seller.photo || "",
 
-      // NOTE: defaulting new listings to "pending" pending admin/seller
-      // review workflow — change to "approved" if products should go
-      // live immediately without moderation.
+      /*
+       * Always saved pending, whatever the automatic check later decides.
+       * Nothing is ever visible to buyers before it has been read by
+       * something, and a crash between the save and the verdict leaves the
+       * listing waiting for an admin rather than live and unchecked.
+       */
       status: "pending",
       isActive: true,
+
+      policyReview: reviewEnabled
+        ? { ticket: reviewTicket(), decision: "checking", reasons: [], summary: "" }
+        : null,
 
       promotion: {
         promoted: false,
@@ -222,14 +355,26 @@ export const productService = {
 
     /*
     |--------------------------------------------------------------------------
-    | Tell admins there's something to review
+    | Check it, or failing that tell admins there's something to review
     |--------------------------------------------------------------------------
-    | Not awaited: fanning out to every admin's devices shouldn't slow the
-    | seller's upload response, and a notification failure must never make a
-    | saved listing look like it failed.
+    | Neither is awaited: reading a listing against the policy, and fanning
+    | out to every admin's devices, must not slow the seller's upload
+    | response — and neither failing may make a saved listing look like it
+    | failed.
+    |
+    | Admins are told only when the check flags the listing, which is the
+    | point of having it: a listing that meets the policy goes live without
+    | anyone being woken for it.
     */
 
-    if (productData.status === "pending") {
+    if (reviewEnabled) {
+      queuePolicyReview(
+        snapshot.id,
+        productData.policyReview.ticket,
+        { ...productData, title, price },
+        { edited: false }
+      );
+    } else if (productData.status === "pending") {
       notifyAdminsOfPendingProduct({
         productId: snapshot.id,
         title,
@@ -341,17 +486,41 @@ export const productService = {
     RE_REVIEW_STATUSES.includes(String(existing.status || "").toLowerCase()) &&
     changedReviewFields(updates, existing).length > 0;
 
+  const reviewEnabled = sendBackForReview && isPolicyReviewEnabled();
+
+  const ticket = reviewEnabled ? reviewTicket() : null;
+
   if (sendBackForReview) {
     updates.status = "pending";
     updates.previousStatus = existing.status;
     updates.resubmittedAt = FieldValue.serverTimestamp();
+
+    /*
+     * A new ticket retires any check still running against the old content,
+     * so an edit made mid-check can't be approved on the strength of the
+     * photos it replaced.
+     */
+    updates.policyReview = reviewEnabled
+      ? { ticket, decision: "checking", reasons: [], summary: "" }
+      : null;
   }
 
   await docRef.set(updates, { merge: true });
 
   const updatedSnapshot = await docRef.get();
 
-  if (sendBackForReview) {
+  if (reviewEnabled) {
+    /*
+     * The saved record, not `updates` — an edit touching only the title must
+     * still be judged alongside the photos and description it kept.
+     */
+    queuePolicyReview(
+      id,
+      ticket,
+      { id, ...updatedSnapshot.data() },
+      { edited: true }
+    );
+  } else if (sendBackForReview) {
     notifyAdminsOfPendingProduct({
       productId: id,
       title: updates.title ?? existing.title ?? updates.name ?? existing.name,
