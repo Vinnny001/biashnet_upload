@@ -1,6 +1,5 @@
-import { getMessaging } from "firebase-admin/messaging";
-
-import firebaseApp, { db, FieldValue } from "../config/firebase.js";
+import { db, FieldValue } from "../config/firebase.js";
+import { pushToUser } from "./pushService.js";
 
 /*
 |--------------------------------------------------------------------------
@@ -17,8 +16,8 @@ import firebaseApp, { db, FieldValue } from "../config/firebase.js";
 | Written to the shared `notifications` collection in the same shape the
 | payment service uses, with audience "ADMIN", so the app files it under the
 | admin account and a tapped push asks the user to sign in as admin. The
-| push sending mirrors the payment service's pushService.js: one send() per
-| device over FCM's HTTP v1 API, removing tokens for uninstalled apps.
+| devices are reached through pushService.js, shared with the seller
+| notifications.
 |
 | Nothing here may ever fail an upload: the listing is already saved, and a
 | notification problem must not make the seller think it wasn't.
@@ -26,14 +25,7 @@ import firebaseApp, { db, FieldValue } from "../config/firebase.js";
 |--------------------------------------------------------------------------
 */
 
-const ANDROID_NOTIFICATION_CHANNEL_ID = "biashnet_default";
-
 const INACTIVE_ADMIN_STATUSES = ["inactive", "disabled", "suspended", "removed"];
-
-const DEAD_TOKEN_CODES = [
-  "messaging/invalid-registration-token",
-  "messaging/registration-token-not-registered"
-];
 
 export async function activeAdminUids() {
   const snapshot = await db.collection("admins").get();
@@ -51,53 +43,6 @@ export async function activeAdminUids() {
   });
 
   return [...uids];
-}
-
-async function pushToUser(userId, { title, message, data }) {
-  const userSnap = await db.collection("users").doc(userId).get();
-  const tokens = userSnap.exists ? userSnap.data().fcmTokens || [] : [];
-
-  if (!Array.isArray(tokens) || tokens.length === 0) return;
-
-  const results = await Promise.allSettled(
-    tokens.map((token) =>
-      getMessaging(firebaseApp).send({
-        token,
-        notification: { title, body: message },
-        // FCM only accepts string values in data.
-        data: Object.fromEntries(
-          Object.entries(data)
-            .filter(([, value]) => value !== undefined && value !== null && value !== "")
-            .map(([key, value]) => [key, String(value)])
-        ),
-        android: {
-          priority: "high",
-          notification: { channelId: ANDROID_NOTIFICATION_CHANNEL_ID }
-        }
-      })
-    )
-  );
-
-  const deadTokens = [];
-
-  results.forEach((result, index) => {
-    if (result.status === "fulfilled") return;
-
-    if (DEAD_TOKEN_CODES.includes(result.reason?.code)) {
-      deadTokens.push(tokens[index]);
-      return;
-    }
-
-    console.error("Admin push rejected by FCM:", userId, result.reason?.code || "", result.reason?.message);
-  });
-
-  if (deadTokens.length > 0) {
-    await db
-      .collection("users")
-      .doc(userId)
-      .update({ fcmTokens: FieldValue.arrayRemove(...deadTokens) })
-      .catch(() => {});
-  }
 }
 
 /*

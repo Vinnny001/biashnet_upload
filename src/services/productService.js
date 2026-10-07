@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import { db, FieldValue } from "../config/firebase.js";
 import { notifyAdminsOfPendingProduct } from "./adminNotificationService.js";
+import { notifySellerOfPolicyVerdict } from "./sellerNotificationService.js";
 import { isPolicyReviewEnabled, reviewListing } from "./policyReviewService.js";
 
 const productsRef = db.collection("products");
@@ -101,6 +102,15 @@ async function startPolicyReview(productId, ticket, listing, { edited = false } 
     return;
   }
 
+  /*
+   * The seller is told either way. The check finishes after their upload has
+   * been answered, so without this their listing either quietly goes live or
+   * quietly waits, and they have no way of knowing which.
+   */
+  await notifySellerOfPolicyVerdict({ productId, listing, verdict }).catch((error) =>
+    console.error(`Could not tell the seller about ${productId}:`, error.message)
+  );
+
   if (verdict.decision === "approve") {
     console.log(`Policy review approved ${productId}; it is live.`);
     return;
@@ -146,7 +156,17 @@ const REVIEW_FIELDS = [
   "images",
 ];
 
-const RE_REVIEW_STATUSES = ["approved", "active", "rejected"];
+/*
+ * "pending" belongs here for a reason that is not obvious. A listing already
+ * waiting for review can still be edited, and if that edit did not start a
+ * fresh review, a verdict already in flight — reached on the words and photos
+ * the seller has just replaced — would still carry the current ticket and be
+ * applied. A listing could go live approved on the strength of content
+ * nothing ever read. An edit while pending therefore replaces the submission
+ * and restarts the review, which is also what the seller is warned about
+ * before they save.
+ */
+const RE_REVIEW_STATUSES = ["approved", "active", "rejected", "pending"];
 
 /*
  * Images are compared by their Cloudinary public_id, so the same photos sent
@@ -492,7 +512,16 @@ export const productService = {
 
   if (sendBackForReview) {
     updates.status = "pending";
-    updates.previousStatus = existing.status;
+
+    /*
+     * Editing a listing that was already pending keeps whatever it was
+     * before that, so the record still says what state the review
+     * interrupted rather than flattening it to "pending".
+     */
+    if (String(existing.status || "").toLowerCase() !== "pending") {
+      updates.previousStatus = existing.status;
+    }
+
     updates.resubmittedAt = FieldValue.serverTimestamp();
 
     /*

@@ -147,5 +147,70 @@ check("no key means a human looks at it", noKey.decision === "flag", noKey.decis
 check("no key is recorded as a failure, not a real verdict", noKey.failed === true);
 check("no key still explains itself to the admin", /GEMINI_API_KEY/.test(noKey.reasons[0]?.detail || ""), noKey.reasons[0]?.detail);
 
+/* ---- what the seller is told ---- */
+
+const { buildPolicyVerdictMessage, summarizeReasons } = await import(
+  "../src/services/sellerNotificationMessages.js"
+);
+
+const LISTING = { title: "Smart Phone", sellerName: "Grace" };
+
+const approved = buildPolicyVerdictMessage({
+  listing: LISTING,
+  verdict: { decision: "approve", reasons: [] },
+});
+check("an approval is told as approved and live", approved.type === "PRODUCT_APPROVED" && /now live/.test(approved.message));
+check("an approval greets the seller by name", approved.message.startsWith("Dear Seller Grace,"), approved.message.slice(0, 20));
+
+const flaggedMsg = buildPolicyVerdictMessage({
+  listing: LISTING,
+  verdict: {
+    decision: "flag",
+    reasons: [{ rule: "TITLES AND DESCRIPTIONS", detail: "The title 'Smart Phone' gives no brand or model." }],
+  },
+});
+check("a flag is filed as pending review, not rejected", flaggedMsg.type === "PRODUCT_PENDING_REVIEW");
+check(
+  "a flag NEVER tells the seller they were rejected",
+  !/reject|refus|declin|denied|viola|breach|broke/i.test(flaggedMsg.message),
+  flaggedMsg.message
+);
+check("a flag says a human is looking at it", /our team is reviewing it/.test(flaggedMsg.message));
+check("a flag passes on what to fix", /TITLES AND DESCRIPTIONS/.test(flaggedMsg.message), flaggedMsg.message);
+check("a flag says it is hidden from buyers meanwhile", /hidden from buyers/.test(flaggedMsg.message));
+check("a flag invites an edit", /edit the listing/i.test(flaggedMsg.message));
+
+const unchecked = buildPolicyVerdictMessage({
+  listing: LISTING,
+  verdict: { decision: "flag", failed: true, reasons: [{ rule: "Not checked automatically", detail: "quota" }] },
+});
+check("a check that could not run is still pending review", unchecked.type === "PRODUCT_PENDING_REVIEW");
+check(
+  "a check that could not run invents no fault in the listing",
+  !/noticed|Not checked/.test(unchecked.message),
+  unchecked.message
+);
+
+check(
+  "an email address is not used as a name to greet",
+  buildPolicyVerdictMessage({
+    listing: { title: "x", sellerName: "seller@example.com" },
+    verdict: { decision: "approve" },
+  }).message.startsWith("Dear Seller,")
+);
+
+check(
+  "a listing with no title still reads as a sentence",
+  buildPolicyVerdictMessage({ listing: {}, verdict: { decision: "approve" } }).title === "Listing approved: your product"
+);
+
+check("two findings are both named", summarizeReasons([{ rule: "A" }, { rule: "B" }]) === "A; B");
+check(
+  "a long list of findings is summarized, not dumped",
+  summarizeReasons([{ rule: "A" }, { rule: "B" }, { rule: "C" }, { rule: "D" }]) === "A; B; and 2 more",
+  summarizeReasons([{ rule: "A" }, { rule: "B" }, { rule: "C" }, { rule: "D" }])
+);
+check("no findings summarizes to nothing", summarizeReasons([]) === "" && summarizeReasons(undefined) === "");
+
 console.log(`\n${total - failures}/${total} passed`);
 process.exit(failures === 0 ? 0 : 1);
